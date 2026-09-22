@@ -1,0 +1,40 @@
+# Git & VCS
+.git
+.gitignore
+
+# Environments & secrets
+.env
+*.env
+.env.*
+backend/.data/
+mcp/.data/
+
+# Python artifacts & virtual environments
+venv/
+.venv/
+*/venv/
+*/.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+
+# Node artifacts (Stage 1 will run fresh npm install)
+node_modules/
+frontend/node_modules/
+.npm/
+
+# Uploads & local media (preserve directory structure without local uploads)
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Documentation & scratch files
+*.md
+docs.txt
+temp.txt
+diff.txt
+out.txt
+output/
+

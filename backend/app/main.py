@@ -1,0 +1,221 @@
+"""
+FastAPI application entry point.
+Mounts all routers and configures CORS for frontend integration.
+"""
+
+# CRITICAL: Override system-level OTEL_SDK_DISABLED=true BEFORE any OTel imports.
+# Without this, all TracerProviders return NoOpTracer and no traces are exported.
+import os
+os.environ["OTEL_SDK_DISABLED"] = "false"
+
+# Load .env into OS environment — Mistral SDK reads MISTRAL_SDK_TELEMETRY
+# from os.environ (pydantic-settings only loads into its own model, not os.environ)
+from dotenv import load_dotenv
+load_dotenv()
+
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.database import engine, Base
+from app.models import Deal, Section, AuditEntry, Version, Upload  # noqa: F401
+from app.models import DealDocument, SectionDocumentLink  # noqa: F401 — register models
+from app.models import MistralAgent, LibraryFile, NarrativeVersion, User, AuthSession  # noqa: F401
+from app.auth import get_current_user
+from app.routers.deals import router as deals_router
+from app.routers.sections import router as sections_router
+from app.routers.versions import router as versions_router
+from app.routers.uploads import router as uploads_router
+from app.routers.exports import router as exports_router
+from app.routers.documents import router as documents_router
+from app.routers.library import router as library_router
+from app.routers.mcp import router as mcp_router
+from app.routers.manufacture import router as manufacture_router
+from app.routers.auth import router as auth_router
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create database tables, connect MCP, and initialize global agents."""
+    import time
+
+    t0 = time.time()
+    logger.info("=== Credit Dossier API Starting ===")
+    from app.telemetry import init_phoenix_telemetry
+    init_phoenix_telemetry(project_name="credit-dossier-api")
+
+    # Step 1: Database
+    t_step = time.time()
+    logger.info("[startup] Creating database tables…")
+    try:
+        Base.metadata.create_all(bind=engine)
+        from app.migrations import apply_additive_migrations
+        apply_additive_migrations(engine)
+
+        from app.database import SessionLocal
+        from app.auth import seed_initial_users
+        from app.services.library_sync_service import LibrarySyncService
+        auth_db = SessionLocal()
+        try:
+            seed_initial_users(auth_db)
+            from app.migrations import backfill_deal_owners
+            fallback_user = auth_db.query(User).order_by(User.created_at).first()
+            if fallback_user:
+                backfill_deal_owners(engine, fallback_user.id)
+            LibrarySyncService.reset_interrupted_syncs(auth_db)
+        finally:
+            auth_db.close()
+        logger.info(f"[startup] Database ready ({(time.time() - t_step)*1000:.0f}ms)")
+    except Exception as e:
+        logger.error(f"[startup] Database initialization warning/error: {e}", exc_info=True)
+
+    from app.services.mistral_library_service import MistralLibraryService
+    from app.services.mcp_service import MCPClientService
+    from app.config import settings
+
+    # Step 2: MCP connection (graceful — don't crash if unreachable)
+    t_step = time.time()
+    logger.info("[startup] Connecting to MCP server…")
+    try:
+        await MCPClientService.connect()
+        logger.info(f"[startup] MCP connected ({(time.time() - t_step)*1000:.0f}ms)")
+    except Exception as e:
+        logger.warning(
+            f"[startup] MCP connection failed ({(time.time() - t_step)*1000:.0f}ms): {e}. "
+            f"Continuing without MCP — orchestration will use library RAG only."
+        )
+
+    # Step 3: Mistral Agents (16 section + 1 orchestration)
+    t_step = time.time()
+    try:
+        db = SessionLocal()
+        try:
+            logger.info("[startup] Initializing Mistral agents…")
+            await MistralLibraryService.initialize_global_agents(db)
+            logger.info(f"[startup] Agents ready ({(time.time() - t_step)*1000:.0f}ms)")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"[startup] Mistral agents initialization warning/error: {e}", exc_info=True)
+
+    total_ms = (time.time() - t0) * 1000
+
+    # Report telemetry status
+    from app.telemetry import is_telemetry_enabled
+    telemetry_status = 'enabled' if is_telemetry_enabled() else 'disabled'
+
+    logger.info(
+        f"=== Startup complete in {total_ms:.0f}ms ==="
+        f" | MCP={'connected' if MCPClientService.is_connected else 'disconnected'}"
+        f" | Orchestration={'enabled' if settings.ORCHESTRATION_ENABLED else 'disabled'}"
+        f" | Telemetry={telemetry_status}"
+        f" | Gen semaphore={settings.GENERATION_SEMAPHORE}"
+        f" | Orch semaphore={settings.ORCHESTRATION_SEMAPHORE}"
+    )
+
+    yield
+
+    logger.info("=== Shutting down ===")
+    try:
+        db = SessionLocal()
+        try:
+            await MistralLibraryService.cleanup_global_agents(db)
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"Error during agent cleanup: {e}")
+    try:
+        await MCPClientService.disconnect()
+    except Exception as e:
+        logger.warning(f"Error during MCP disconnect: {e}")
+    logger.info("=== Shutdown complete ===")
+
+
+app = FastAPI(
+    title="Credit Dossier API",
+    description="Backend API for the Credit Pitch Book Pipeline — deals, narratives, exports.",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+# ── CORS ────────────────────────────────────────────────────────
+cors_origins = [
+    "http://localhost:8080",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+]
+
+# Automatically detect RAILWAY_PUBLIC_DOMAIN and add to CORS origins
+railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+if railway_domain:
+    clean_domain = railway_domain.removeprefix("https://").removeprefix("http://").rstrip("/")
+    cors_origins.extend([
+        f"https://{clean_domain}",
+        f"http://{clean_domain}",
+    ])
+
+# Optional custom CORS origins from environment
+custom_origins = os.environ.get("CORS_ORIGINS", "").strip()
+if custom_origins:
+    cors_origins.extend([o.strip() for o in custom_origins.split(",") if o.strip()])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Mount routers ───────────────────────────────────────────────
+authenticated = [Depends(get_current_user)]
+app.include_router(auth_router)
+app.include_router(deals_router, dependencies=authenticated)
+app.include_router(sections_router, dependencies=authenticated)
+app.include_router(versions_router, dependencies=authenticated)
+app.include_router(uploads_router, dependencies=authenticated)
+app.include_router(exports_router, dependencies=authenticated)
+app.include_router(documents_router, dependencies=authenticated)
+app.include_router(library_router, dependencies=authenticated)
+app.include_router(mcp_router, dependencies=authenticated)
+app.include_router(manufacture_router, dependencies=authenticated)
+
+
+@app.get("/api/health")
+def health_check():
+    from app.services.mcp_service import MCPClientService
+    from app.database import SessionLocal
+    from app.models.mistral_agent import MistralAgent
+
+    db = SessionLocal()
+    try:
+        agent_count = db.query(MistralAgent).count()
+    finally:
+        db.close()
+
+    from app.telemetry import is_telemetry_enabled
+
+    return {
+        "status": "ok",
+        "service": "Credit Dossier API",
+        "version": "2.0.0",
+        "agents_initialized": agent_count,
+        "orchestration_enabled": settings.ORCHESTRATION_ENABLED,
+        "telemetry_enabled": is_telemetry_enabled(),
+        "generation_semaphore": settings.GENERATION_SEMAPHORE,
+        "orchestration_semaphore": settings.ORCHESTRATION_SEMAPHORE,
+        "mcp": MCPClientService.get_health_status(),
+    }
