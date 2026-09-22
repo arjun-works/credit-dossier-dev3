@@ -77,6 +77,9 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 def create_session(db: Session, user: User) -> tuple[str, AuthSession]:
+    # Clear any previous sessions for this user so re-login never violates unique user_id constraints
+    db.query(AuthSession).filter(AuthSession.user_id == user.id).delete(synchronize_session=False)
+
     raw_token = secrets.token_urlsafe(48)
     session = AuthSession(
         token_hash=hashlib.sha256(raw_token.encode("utf-8")).hexdigest(),

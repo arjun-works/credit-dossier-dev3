@@ -66,6 +66,17 @@ def apply_additive_migrations(engine: Engine) -> list[str]:
                 connection.execute(text("ALTER TABLE users ALTER COLUMN role TYPE VARCHAR(32)"))
                 applied.append("users.role_length")
 
+        if "auth_sessions" in existing_tables and engine.dialect.name == "postgresql":
+            # If ix_auth_sessions_user_id is a UNIQUE index or constraint, drop and replace with a standard index
+            try:
+                connection.execute(text("DROP INDEX IF EXISTS ix_auth_sessions_user_id"))
+                connection.execute(text("ALTER TABLE auth_sessions DROP CONSTRAINT IF EXISTS ix_auth_sessions_user_id"))
+                connection.execute(text("ALTER TABLE auth_sessions DROP CONSTRAINT IF EXISTS uq_auth_sessions_user_id"))
+                connection.execute(text("CREATE INDEX IF NOT EXISTS ix_auth_sessions_user_id ON auth_sessions (user_id)"))
+                applied.append("auth_sessions.non_unique_user_id")
+            except Exception as e:
+                logger.warning("Could not adjust auth_sessions index: %s", e)
+
         for table_name, columns in _ADDITIVE_MIGRATIONS.items():
             if table_name not in existing_tables:
                 continue
