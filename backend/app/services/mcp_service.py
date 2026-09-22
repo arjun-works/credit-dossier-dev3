@@ -111,9 +111,20 @@ class MCPClientService:
                 cls._record_success()
                 logger.info("MCP server is reachable — warm-up ping succeeded.")
         except Exception as e:
-            logger.error(f"MCP warm-up ping failed: {e}")
+            logger.warning(f"MCP warm-up ping failed (server may still be starting): {e}")
             cls.is_connected = False
             cls._record_failure()
+
+    @classmethod
+    async def is_ready(cls) -> bool:
+        """Return True if connected, or attempt a quick reconnect if not."""
+        if cls.is_connected:
+            return True
+        try:
+            await cls.connect()
+        except Exception:
+            pass
+        return cls.is_connected
 
     @classmethod
     async def disconnect(cls) -> None:

@@ -1,18 +1,17 @@
 {
-    admin off
+	admin off
 }
 
 :{$PORT:8080} {
-    # Route API requests directly to FastAPI backend
-    handle /api/* {
-        reverse_proxy 127.0.0.1:8000
-    }
+	# Route API requests directly to FastAPI backend
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8000
+	}
 
-    # Route all other requests to Vite preview server
-    handle {
-        reverse_proxy 127.0.0.1:3000 {
-            header_up Host {upstream_hostport}
-        }
-    }
+	# Route all other requests to Vite preview server
+	handle {
+		reverse_proxy 127.0.0.1:3000 {
+			header_up Host {upstream_hostport}
+		}
+	}
 }
-

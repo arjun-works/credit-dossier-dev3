@@ -123,13 +123,16 @@ def init_db() -> None:
                     """
                 ).format(sql.Identifier(schema_name, bare_name))
             )
-            for column_name in TABLE_COLUMNS[table_name]:
+            cols = TABLE_COLUMNS[table_name]
+            if cols:
+                alter_items = [
+                    sql.SQL("ADD COLUMN IF NOT EXISTS {} TEXT").format(sql.Identifier(col))
+                    for col in cols
+                ]
                 conn.execute(
-                    sql.SQL(
-                        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT"
-                    ).format(
+                    sql.SQL("ALTER TABLE {} {}").format(
                         sql.Identifier(schema_name, bare_name),
-                        sql.Identifier(column_name),
+                        sql.SQL(", ").join(alter_items),
                     )
                 )
         conn.commit()

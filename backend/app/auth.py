@@ -114,7 +114,19 @@ def seed_initial_users(db: Session) -> None:
         user_id = str(configured_user_id or "").strip().lower()
         if not user_id or not password:
             continue
-        if db.query(User).filter(User.user_id == user_id).first():
+        existing = db.query(User).filter(User.user_id == user_id).first()
+        if existing:
+            if not verify_password(password, existing.password_hash):
+                try:
+                    validate_password_strength(password, user_id)
+                    existing.password_hash = hash_password(password)
+                    existing.is_active = True
+                    changed = True
+                    logger.info("[startup] Synchronized/updated password for existing user: %r", user_id)
+                except ValueError as err:
+                    logger.warning("[startup] Could not update password for %r: %s", user_id, err)
+            else:
+                logger.info("[startup] User %r already exists with verified password.", user_id)
             continue
         try:
             validate_password_strength(password, user_id)

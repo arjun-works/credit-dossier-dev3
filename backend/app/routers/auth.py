@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.auth import (
     SESSION_HOURS,
@@ -96,14 +99,33 @@ def login(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.user_id == credentials.user_id).first()
-    if not user or not user.is_active or not verify_password(credentials.password, user.password_hash):
+    clean_user_id = credentials.user_id.strip().lower()
+    user = (
+        db.query(User)
+        .filter((User.user_id == clean_user_id) | (User.user_id == credentials.user_id.strip()))
+        .first()
+    )
+    if not user:
+        logger.warning("[auth] Login failed: User %r not found in database", credentials.user_id)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid user ID or password.",
+        )
+    if not user.is_active:
+        logger.warning("[auth] Login failed: User %r is inactive", credentials.user_id)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account is inactive.",
+        )
+    if not verify_password(credentials.password, user.password_hash):
+        logger.warning("[auth] Login failed: Password mismatch for user %r", credentials.user_id)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid user ID or password.",
         )
     raw_token, _ = create_session(db, user)
     _set_session_cookie(response, raw_token, session_cookie_name(request))
+    logger.info("[auth] Login successful for user %r (%s)", user.user_id, user.role)
     return UserResponse(user_id=user.user_id, role=user.role)
 
 
